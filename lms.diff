@@ -1,0 +1,19 @@
+  305 
+  306 async def main():
+  307     """Main entry point"""
+- 308     # Configuration - adjust these values for your setup
++ 308     # Configuration - UPDATE pixoo_host with your Pixoo64 IP address
++ 309     # For other settings (LMS host/port, poll interval, etc.),
++ 310     # modify the defaults in the Config class above
+  311     config = Config(
+- 310         lms_host="localhost",      # LMS server IP/hostname
+- 311         lms_port=9000,             # LMS JSON-RPC port (default 9000)
+- 312         lms_player_id="",          # Leave empty to auto-detect first player
+- 313         pixoo_host="192.168.1.100", # UPDATE THIS with your Pixoo64 IP address
+- 314         pixoo_port=80,
+- 315         poll_interval=1.0,         # Check for track changes every second
++ 312         pixoo_host="192.168.1.100",  # UPDATE THIS with your Pixoo64 IP address
+  313     )
+  314 
+  315     service = AlbumArtService(config)
+

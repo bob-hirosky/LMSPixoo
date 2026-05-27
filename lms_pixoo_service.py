@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""
+LMS to Pixoo64 Album Art Display Service
+Monitors Lyrion Media Server for song changes and displays album art on Divoom Pixoo64
+"""
+
+import asyncio
+import aiohttp
+import json
+import logging
+from PIL import Image
+from io import BytesIO
+import base64
+from typing import Optional, Dict, Any
+from dataclasses import dataclass
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Config:
+    """Service configuration"""
+    lms_host: str = "192.168.2.78"
+    lms_port: int = 9000
+    lms_player_id: str = "aa:aa:cd:8f:38:b0"  # MAC address of player, empty = first player
+    pixoo_host: str = "192.168.2.206"  # Update with your Pixoo64 IP
+    pixoo_port: int = 80
+    poll_interval: float = 1.0  # seconds
+    image_size: int = 64
+
+
+class PixooClient:
+    """Client for Divoom Pixoo64 LED display"""
+
+    def __init__(self, host: str, port: int = 80):
+        self.host = host
+        self.port = port
+        self.base_url = f"http://{host}:{port}"
+
+    async def send_image(self, image: Image.Image) -> bool:
+        """
+        Send image to Pixoo64 display
+        Image should already be 64x64 pixels
+        """
+        try:
+            # Ensure image is 64x64 RGB
+            if image.size != (64, 64):
+                image = image.resize((64, 64), Image.Resampling.LANCZOS)
+
+            # Convert to RGB
+            image = image.convert('RGB')
+
+            # Create raw RGB byte array (row-major order)
+            rgb_bytes = bytearray()
+            for y in range(64):
+                for x in range(64):
+                    r, g, b = image.getpixel((x, y))
+                    rgb_bytes.extend([r, g, b])
+
+            # Convert to bytes for base64 encoding
+            pixel_data = bytes(rgb_bytes)
+
+            async with aiohttp.ClientSession() as session:
+                # Step 1: Switch to custom channel (channel 3)
+                channel_payload = {
+                    "Command": "Channel/SetIndex",
+                    "SelectIndex": 3
+                }
+                await session.post(
+                    f"{self.base_url}/post",
+                    json=channel_payload,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                )
+
+                # Step 2: Reset animation
+                reset_payload = {
+                    "Command": "Draw/ResetHttpGifId"
+                }
+                await session.post(
+                    f"{self.base_url}/post",
+                    json=reset_payload,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                )
+
+                # Step 3: Send raw RGB pixel data
+                # (Note: Despite command name "SendHttpGif", we send raw RGB bytes)
+                pixel_payload = {
+                    "Command": "Draw/SendHttpGif",
+                    "PicNum": 1,
+                    "PicWidth": 64,
+                    "PicOffset": 0,
+                    "PicID": 0,
+                    "PicSpeed": 1000,
+                    "PicData": base64.b64encode(pixel_data).decode('utf-8')
+                }
+
+                async with session.post(
+                    f"{self.base_url}/post",
+                    json=pixel_payload,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    # Check if pixel data was sent successfully
+                    if response.status != 200:
+                        logger.error(f"Pixoo64 returned status {response.status}")
+                        return False
+
+                # Step 4: Play/display the image
+                play_payload = {
+                    "Command": "Draw/SendHttpItemList",
+                    "ItemList": []
+                }
+                async with session.post(
+                    f"{self.base_url}/post",
+                    json=play_payload,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    if response.status == 200:
+                        logger.info("Successfully sent image to Pixoo64")
+                        return True
+                    else:
+                        logger.error(f"Failed to display image: status {response.status}")
+                        return False
+
+        except Exception as e:
+            logger.error(f"Error sending image to Pixoo64: {e}")
+            return False
+
+    async def test_connection(self) -> bool:
+        """Test connection to Pixoo64"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{self.base_url}/get",
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    if response.status == 200:
+                        logger.info("Pixoo64 connection successful")
+                        return True
+                    return False
+        except Exception as e:
+            logger.error(f"Cannot connect to Pixoo64: {e}")
+            return False
+
+
+class LMSMonitor:
+    """Monitor Lyrion Media Server for song changes"""
+
+    def __init__(self, host: str, port: int, player_id: str = ""):
+        self.host = host
+        self.port = port
+        self.player_id = player_id
+        self.current_track_id: Optional[str] = None
+        self.session: Optional[aiohttp.ClientSession] = None
+
+    async def _send_command(self, command: str, params: list = None) -> Optional[Dict[str, Any]]:
+        """Send JSON-RPC command to LMS"""
+        if params is None:
+            params = []
+
+        payload = {
+            "id": 1,
+            "method": "slim.request",
+            "params": [self.player_id, [command] + params]
+        }
+
+        try:
+            if not self.session:
+                self.session = aiohttp.ClientSession()
+
+            async with self.session.post(
+                f"http://{self.host}:{self.port}/jsonrpc.js",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get('result', {})
+                else:
+                    logger.error(f"LMS returned status {response.status}")
+                    return None
+        except Exception as e:
+            logger.error(f"Error communicating with LMS: {e}")
+            return None
+
+    async def get_player_id(self) -> Optional[str]:
+        """Get first available player if not specified"""
+        result = await self._send_command("players", ["0", "1"])
+        if result and "players_loop" in result and len(result["players_loop"]) > 0:
+            player = result["players_loop"][0]
+            player_id = player.get("playerid")
+            logger.info(f"Found player: {player.get('name')} ({player_id})")
+            return player_id
+        return None
+
+    async def initialize(self) -> bool:
+        """Initialize connection to LMS"""
+        if not self.player_id:
+            self.player_id = await self.get_player_id()
+            if not self.player_id:
+                logger.error("No LMS player found")
+                return False
+        return True
+
+    async def get_current_track_info(self) -> Optional[Dict[str, Any]]:
+        """Get information about currently playing track"""
+        result = await self._send_command("status", ["-", "1", "tags:alcu"])
+        if result and "playlist_loop" in result and len(result["playlist_loop"]) > 0:
+            return result["playlist_loop"][0]
+        return None
+
+    async def get_album_art_url(self, track_info: Dict[str, Any]) -> Optional[str]:
+        """Extract album art URL from track info"""
+        # LMS provides cover art via a special URL
+        if "artwork_url" in track_info:
+            return f"http://{self.host}:{self.port}/{track_info['artwork_url']}"
+        elif "coverid" in track_info:
+            return f"http://{self.host}:{self.port}/music/{track_info['coverid']}/cover.jpg"
+        return None
+
+    async def download_album_art(self, url: str) -> Optional[Image.Image]:
+        """Download and return album art as PIL Image"""
+        try:
+            if not self.session:
+                self.session = aiohttp.ClientSession()
+
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    image_data = await response.read()
+                    image = Image.open(BytesIO(image_data))
+                    logger.info(f"Downloaded album art: {image.size}")
+                    return image
+                else:
+                    logger.error(f"Failed to download album art: status {response.status}")
+                    return None
+        except Exception as e:
+            logger.error(f"Error downloading album art: {e}")
+            return None
+
+    async def close(self):
+        """Close session"""
+        if self.session:
+            await self.session.close()
+
+
+class AlbumArtService:
+    """Main service to monitor LMS and update Pixoo64"""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.lms = LMSMonitor(config.lms_host, config.lms_port, config.lms_player_id)
+        self.pixoo = PixooClient(config.pixoo_host, config.pixoo_port)
+        self.current_track_id: Optional[str] = None
+        self.running = False
+
+    async def process_new_track(self, track_info: Dict[str, Any]):
+        """Process a new track - get album art and send to Pixoo64"""
+        logger.info(f"New track: {track_info.get('artist', 'Unknown')} - {track_info.get('title', 'Unknown')}")
+
+        # Get album art URL
+        art_url = await self.lms.get_album_art_url(track_info)
+        if not art_url:
+            logger.warning("No album art URL available")
+            return
+
+        # Download album art
+        image = await self.lms.download_album_art(art_url)
+        if not image:
+            logger.warning("Failed to download album art")
+            return
+
+        # Send to Pixoo64
+        await self.pixoo.send_image(image)
+
+    async def monitor_loop(self):
+        """Main monitoring loop"""
+        logger.info("Starting monitoring loop...")
+
+        while self.running:
+            try:
+                # Get current track info
+                track_info = await self.lms.get_current_track_info()
+
+                if track_info:
+                    # Check if track has changed
+                    track_id = track_info.get("id")
+                    if track_id and track_id != self.current_track_id:
+                        self.current_track_id = track_id
+                        await self.process_new_track(track_info)
+
+                # Wait before next poll
+                await asyncio.sleep(self.config.poll_interval)
+
+            except Exception as e:
+                logger.error(f"Error in monitoring loop: {e}", exc_info=True)
+                await asyncio.sleep(self.config.poll_interval)
+
+    async def start(self):
+        """Start the service"""
+        logger.info("Starting LMS to Pixoo64 service...")
+
+        # Test Pixoo64 connection
+        if not await self.pixoo.test_connection():
+            logger.error("Cannot connect to Pixoo64. Check IP address and network.")
+            return
+
+        # Initialize LMS connection
+        if not await self.lms.initialize():
+            logger.error("Cannot connect to LMS. Check host and port.")
+            return
+
+        # Start monitoring
+        self.running = True
+        try:
+            await self.monitor_loop()
+        finally:
+            await self.lms.close()
+
+    def stop(self):
+        """Stop the service"""
+        logger.info("Stopping service...")
+        self.running = False
+
+
+async def main():
+    """Main entry point"""
+    service = AlbumArtService(Config())
+
+    try:
+        await service.start()
+    except KeyboardInterrupt:
+        logger.info("Received shutdown signal")
+        service.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    

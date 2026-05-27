@@ -71,7 +71,7 @@
      lms_host="localhost",       # LMS server IP/hostname
      lms_port=9000,              # LMS JSON-RPC port
      lms_player_id="",           # MAC address or empty for auto-detect
-     pixoo_host="192.168.1.100", # Your Pixoo64 IP
+     pixoo_host="192.168.2.206", # Your Pixoo64 IP
      pixoo_port=80,              # Pixoo64 HTTP port
      poll_interval=1.0,          # Check interval in seconds
  )
