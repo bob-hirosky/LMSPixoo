@@ -5,6 +5,8 @@ Monitors Lyrion Media Server for song changes and displays album art on Divoom P
 """
 
 import asyncio
+import argparse
+import sys
 import aiohttp
 import json
 import logging
@@ -205,6 +207,108 @@ class LMSMonitor:
                 return False
         return True
 
+
+    async def select_player_interactive(self) -> Optional[str]:
+        """Prompt user to select from available players"""
+        result = await self._send_command("players", ["0", "100"])
+
+        if not result or "players_loop" not in result:
+            logger.error("No players found")
+            return None
+
+        players = result["players_loop"]
+
+        if not players:
+            logger.error("No players available")
+            return None
+
+        print("\nAvailable LMS Players:")
+        for idx, player in enumerate(players, 1):
+            print(f"{idx}. {player.get('name')} ({player.get('playerid')})")
+
+        while True:
+            try:
+                choice = input("Select player number: ").strip()
+                selection = int(choice)
+
+                if 1 <= selection <= len(players):
+                    selected = players[selection - 1]
+                    player_id = selected.get("playerid")
+                    logger.info(f"Selected player: {selected.get('name')} ({player_id})")
+                    return player_id
+                else:
+                    print("Invalid selection. Try again.")
+            except (ValueError, KeyboardInterrupt):
+                print("Invalid input. Enter a number.")
+
+    async def _send_command_global(self, command: str, params: list = None) -> Optional[Dict[str, Any]]:
+        """Send server-level JSON-RPC command (no player context)"""
+        if params is None:
+            params = []
+
+        payload = {
+            "id": 1,
+            "method": "slim.request",
+            "params": ["", [command] + params]  # empty player_id
+        }
+
+        try:
+            if not self.session:
+                self.session = aiohttp.ClientSession()
+
+            async with self.session.post(
+                    f"http://{self.host}:{self.port}/jsonrpc.js",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=5)
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get("result", {})
+                else:
+                    logger.error(f"LMS returned status {response.status}")
+                    return None
+        except Exception as e:
+            logger.error(f"Error communicating with LMS: {e}")
+            return None
+    
+    async def select_player_interactive2(self) -> Optional[str]:
+        """Prompt user to select from available players"""
+        result = await self._send_command_global("players", ["0", "100"])
+
+        if not result or "players_loop" not in result:
+            logger.error("No players found")
+            return None
+
+        players = result["players_loop"]
+
+        if not players:
+            logger.error("No players available")
+            return None
+
+        print("\nAvailable LMS Players:")
+        for idx, player in enumerate(players, 1):
+            print(f"{idx}. {player.get('name')} ({player.get('playerid')})")
+
+            while True:
+                try:
+                    choice = input("Select player number (Ctrl-C to cancel): ").strip()
+                    selection = int(choice)
+
+                    if 1 <= selection <= len(players):
+                        selected = players[selection - 1]
+                        player_id = selected.get("playerid")
+                        logger.info(f"Selected player: {selected.get('name')} ({player_id})")
+                        return player_id
+                    else:
+                        print("Invalid selection. Try again.")
+
+                except ValueError:
+                    print("Invalid input. Enter a number.")
+
+                except KeyboardInterrupt:
+                    print("\nSelection cancelled.")
+                    raise  # <-- let it propagate properly
+                
     async def get_current_track_info(self) -> Optional[Dict[str, Any]]:
         """Get information about currently playing track"""
         result = await self._send_command("status", ["-", "1", "tags:alcu"])
@@ -231,7 +335,20 @@ class LMSMonitor:
                 if response.status == 200:
                     image_data = await response.read()
                     image = Image.open(BytesIO(image_data))
-                    logger.info(f"Downloaded album art: {image.size}")
+                    
+                    # Normalize problematic image modes
+                    if image.mode == "P":
+                        image = image.convert("RGBA")
+
+                    if image.mode in ("RGBA", "LA"):
+                        # Remove transparency by compositing onto black background
+                        background = Image.new("RGB", image.size, (0, 0, 0))
+                        background.paste(image, mask=image.split()[-1])
+                        image = background
+                    else:
+                        image = image.convert("RGB")
+
+                    logger.info(f"Downloaded album art: {image.size} ({image.mode})")
                     return image
                 else:
                     logger.error(f"Failed to download album art: status {response.status}")
@@ -245,6 +362,7 @@ class LMSMonitor:
         if self.session:
             await self.session.close()
 
+    
 
 class AlbumArtService:
     """Main service to monitor LMS and update Pixoo64"""
@@ -324,16 +442,100 @@ class AlbumArtService:
         logger.info("Stopping service...")
         self.running = False
 
-
 async def main():
-    """Main entry point"""
-    service = AlbumArtService(Config())
+    """Main entry point with CLI support"""
+
+    parser = argparse.ArgumentParser(
+        description="LMS to Pixoo64 Album Art Display Service"
+    )
+
+    parser.add_argument(
+        "--host",
+        help="LMS server hostname or IP address"
+    )
+
+    parser.add_argument(
+        "--pixoo-ip",
+        help="Pixoo64 IP address"
+    )
+
+    parser.add_argument(
+        "--player-id",
+        help="LMS player MAC address"
+    )
+
+    parser.add_argument(
+        "-s",
+        action="store_true",
+        help="Select LMS player interactively"
+    )
+
+    parser.add_argument(
+        "--list-players",
+        action="store_true",
+        help="List available LMS players and exit"
+    )
+
+    args = parser.parse_args()
+
+    # Start with default config
+    config = Config()
+
+    # Override config from CLI if provided
+    if args.host:
+        config.lms_host = args.host
+
+    if args.pixoo_ip:
+        config.pixoo_host = args.pixoo_ip
+
+    if args.player_id:
+        config.lms_player_id = args.player_id
+
+    # Temporary LMS monitor for selection / listing
+    temp_lms = LMSMonitor(config.lms_host, config.lms_port, "")
 
     try:
+        # --list-players mode
+        if args.list_players:
+            result = await temp_lms._send_command("players", ["0", "100"])
+
+            if not result or "players_loop" not in result:
+                print("No players found.")
+                return
+
+            players = result["players_loop"]
+
+            if not players:
+                print("No players available.")
+                return
+
+            print("\nAvailable LMS Players:")
+            for player in players:
+                print(f"- {player.get('name')} ({player.get('playerid')})")
+
+            return
+
+        # -s interactive selection
+        if args.s:
+            selected_player = await temp_lms.select_player_interactive()
+
+            if not selected_player:
+                logger.error("No player selected. Exiting.")
+                return
+
+            config.lms_player_id = selected_player
+
+        await temp_lms.close()
+
+        # Create service with final config
+        service = AlbumArtService(config)
+
         await service.start()
+
     except KeyboardInterrupt:
         logger.info("Received shutdown signal")
-        service.stop()
+    finally:
+        await temp_lms.close()
 
 
 if __name__ == "__main__":
