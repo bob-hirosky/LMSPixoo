@@ -412,6 +412,12 @@ class AlbumArtService:
                 # Wait before next poll
                 await asyncio.sleep(self.config.poll_interval)
 
+            except asyncio.CancelledError:
+                logger.info("Monitoring loop cancelled")
+                break
+            except KeyboardInterrupt:
+                logger.info("Monitoring loop interrupted")
+                break
             except Exception as e:
                 logger.error(f"Error in monitoring loop: {e}", exc_info=True)
                 await asyncio.sleep(self.config.poll_interval)
@@ -434,7 +440,12 @@ class AlbumArtService:
         self.running = True
         try:
             await self.monitor_loop()
+        except asyncio.CancelledError:
+            logger.info("Received shutdown signal")
+        except KeyboardInterrupt:
+            logger.info("Received shutdown signal")
         finally:
+            self.running = False
             await self.lms.close()
 
     def stop(self):
@@ -532,6 +543,8 @@ async def main():
 
         await service.start()
 
+    except asyncio.CancelledError:
+        logger.info("Received shutdown signal")
     except KeyboardInterrupt:
         logger.info("Received shutdown signal")
     finally:

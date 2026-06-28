@@ -225,8 +225,12 @@ async def monitor_playback(client: LMSTestClient, player_id: str, interval: floa
 
             await asyncio.sleep(interval)
 
+        except asyncio.CancelledError:
+            print("\n\nMonitoring stopped by user")
+            return
         except KeyboardInterrupt:
-            raise
+            print("\n\nMonitoring stopped by user")
+            return
         except Exception as e:
             logger.error(f"Error during monitoring: {e}")
             await asyncio.sleep(interval)
@@ -320,6 +324,8 @@ async def main():
         # Start monitoring
         await monitor_playback(client, player_id, interval=1.0)
 
+    except asyncio.CancelledError:
+        print("\n\nMonitoring stopped by user")
     except KeyboardInterrupt:
         print("\n\nMonitoring stopped by user")
     except Exception as e:
@@ -327,6 +333,22 @@ async def main():
     finally:
         await client.close()
         print("\n✓ Test completed")
+
+
+def test_monitor_playback_returns_when_cancelled():
+    """The monitor loop should exit cleanly when the task is cancelled."""
+
+    class DummyClient:
+        async def get_current_track(self, player_id: str):
+            return {"id": "track-1", "mode": "play"}
+
+    async def run_monitor():
+        task = asyncio.create_task(monitor_playback(DummyClient(), "player-1", interval=0.01))
+        await asyncio.sleep(0.02)
+        task.cancel()
+        await task
+
+    asyncio.run(run_monitor())
 
 
 if __name__ == "__main__":
