@@ -10,10 +10,10 @@ import sys
 import aiohttp
 import json
 import logging
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 import base64
-from typing import Optional, Dict, Any
+from typing import List, Optional, Dict, Any
 from dataclasses import dataclass
 
 logging.basicConfig(
@@ -33,6 +33,7 @@ class Config:
     pixoo_port: int = 80
     poll_interval: float = 1.0  # seconds
     image_size: int = 64
+    show_title: bool = False  # overlay scrolling song title at the bottom
 
 
 class PixooClient:
@@ -42,7 +43,7 @@ class PixooClient:
         self.host = host
         self.port = port
         self.base_url = f"http://{host}:{port}"
-        self._last_pixel_data: Optional[bytes] = None
+        self._last_frames: Optional[List[bytes]] = None
 
     @staticmethod
     def _to_pixel_data(image: Image.Image) -> bytes:
@@ -63,8 +64,13 @@ class PixooClient:
 
         return bytes(rgb_bytes)
 
-    async def _push_pixel_data(self, pixel_data: bytes, session: aiohttp.ClientSession) -> bool:
-        """Push raw 64x64 RGB bytes to the display using the 4-step sequence."""
+    async def _push_pixel_data(self, frames: List[bytes], session: aiohttp.ClientSession,
+                               frame_ms: int = 200) -> bool:
+        """Push raw 64x64 RGB frame(s) to the display using the 4-step sequence.
+
+        With multiple frames the device plays them as a looping animation,
+        each frame shown for frame_ms milliseconds.
+        """
         # Step 1: Switch to custom channel (channel 3)
         channel_payload = {
             "Command": "Channel/SetIndex",
@@ -86,27 +92,27 @@ class PixooClient:
             timeout=aiohttp.ClientTimeout(total=5)
         )
 
-        # Step 3: Send raw RGB pixel data
+        # Step 3: Send raw RGB pixel data, one chunk per frame
         # (Note: Despite command name "SendHttpGif", we send raw RGB bytes)
-        pixel_payload = {
-            "Command": "Draw/SendHttpGif",
-            "PicNum": 1,
-            "PicWidth": 64,
-            "PicOffset": 0,
-            "PicID": 0,
-            "PicSpeed": 1000,
-            "PicData": base64.b64encode(pixel_data).decode('utf-8')
-        }
+        for offset, pixel_data in enumerate(frames):
+            pixel_payload = {
+                "Command": "Draw/SendHttpGif",
+                "PicNum": len(frames),
+                "PicWidth": 64,
+                "PicOffset": offset,
+                "PicID": 0,
+                "PicSpeed": frame_ms,
+                "PicData": base64.b64encode(pixel_data).decode('utf-8')
+            }
 
-        async with session.post(
-            f"{self.base_url}/post",
-            json=pixel_payload,
-            timeout=aiohttp.ClientTimeout(total=5)
-        ) as response:
-            # Check if pixel data was sent successfully
-            if response.status != 200:
-                logger.error(f"Pixoo64 returned status {response.status}")
-                return False
+            async with session.post(
+                f"{self.base_url}/post",
+                json=pixel_payload,
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as response:
+                if response.status != 200:
+                    logger.error(f"Pixoo64 returned status {response.status}")
+                    return False
 
         # Step 4: Play/display the image
         play_payload = {
@@ -124,31 +130,59 @@ class PixooClient:
 
         return True
 
-    async def send_image(self, image: Image.Image) -> bool:
+    async def send_image(self, image: Image.Image, title: str = "") -> bool:
         """
         Send image to Pixoo64 display
         Image should already be 64x64 pixels
 
+        If title is given, it is drawn in a bar at the bottom; titles too
+        wide for the display scroll as a looping marquee.
+
         Skips the update if the image is identical to the one currently shown.
         """
         try:
-            pixel_data = self._to_pixel_data(image)
+            if title:
+                frames = [self._to_pixel_data(f) for f in make_title_frames(image, title)]
+            else:
+                frames = [self._to_pixel_data(image)]
 
             # Nothing to do if the display already shows this exact image
-            if pixel_data == self._last_pixel_data:
+            if frames == self._last_frames:
                 logger.info("Image unchanged; skipping update")
                 return True
 
             async with aiohttp.ClientSession() as session:
-                if not await self._push_pixel_data(pixel_data, session):
+                if not await self._push_pixel_data(frames, session):
                     return False
 
-            self._last_pixel_data = pixel_data
-            logger.info("Successfully sent image to Pixoo64")
+            self._last_frames = frames
+            logger.info(f"Successfully sent image to Pixoo64 ({len(frames)} frame(s))")
             return True
 
         except Exception as e:
             logger.error(f"Error sending image to Pixoo64: {e}")
+            return False
+
+    async def reset(self) -> bool:
+        """Restore the default time/weather display (clock channel)."""
+        steps = [
+            # Stop any HTTP gif stream we may have started
+            {"Command": "Draw/ResetHttpGifId"},
+            # Switch back to the clock channel (0 = time/weather faces)
+            {"Command": "Channel/SetIndex", "SelectIndex": 0},
+        ]
+        try:
+            async with aiohttp.ClientSession() as session:
+                for payload in steps:
+                    await session.post(
+                        f"{self.base_url}/post",
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    )
+            logger.info("Pixoo64 reset to time/weather display")
+            return True
+        except Exception as e:
+            logger.error(f"Error resetting Pixoo64: {e}")
             return False
 
     async def test_connection(self) -> bool:
@@ -384,6 +418,56 @@ class LMSMonitor:
 
     
 
+TITLE_BAR_HEIGHT = 10
+
+
+def _draw_title_frame(art: Image.Image, title: str, text_width: int,
+                      x_offset: int, font, bbox) -> Image.Image:
+    """Render one frame: album art with the title bar drawn at x_offset."""
+    frame = art.copy()
+    draw = ImageDraw.Draw(frame)
+    bar_top = 64 - TITLE_BAR_HEIGHT
+    draw.rectangle([0, bar_top, 63, 63], fill=(0, 0, 0))
+    # Vertically center the glyph box in the bar, compensating for the
+    # font's own y offset so descenders aren't clipped at the bottom edge.
+    text_height = bbox[3] - bbox[1]
+    y = bar_top + (TITLE_BAR_HEIGHT - text_height) // 2 - bbox[1]
+    draw.text((x_offset, y), title, fill=(255, 255, 255), font=font)
+    return frame
+
+
+def make_title_frames(image: Image.Image, title: str,
+                      hold_frames: int = 4, gap: int = 32,
+                      step: int = 2) -> List[Image.Image]:
+    """Build the animation frames for the title overlay.
+
+    Short titles that fit the 64px width are centered and held still.
+    Longer titles scroll leftwards as a looping marquee, pausing at the
+    start, with blank space between repetitions. `step` is the scroll
+    distance in pixels per frame (larger = faster, fewer frames).
+    """
+    font = ImageFont.load_default()
+    art = image.copy().convert('RGB').resize((64, 64), Image.Resampling.LANCZOS)
+
+    bbox = font.getbbox(title)
+    text_width = bbox[2] - bbox[0]
+
+    if text_width <= 64:
+        # Fits: single static frame, centered
+        x = (64 - text_width) // 2 - bbox[0]
+        return [_draw_title_frame(art, title, text_width, x, font, bbox)]
+
+    # Scrolling marquee: start with the text fully on-screen (x=0),
+    # then shift left until the tail end has cleared, plus a blank gap.
+    scroll_range = text_width + gap
+    frames = [
+        _draw_title_frame(art, title, text_width, -bbox[0] - x, font, bbox)
+        for x in range(0, scroll_range + 1, step)
+    ]
+    # Hold the first frame a little so the start of the title lingers
+    return frames[:1] * hold_frames + frames
+
+
 class AlbumArtService:
     """Main service to monitor LMS and update Pixoo64"""
 
@@ -410,8 +494,9 @@ class AlbumArtService:
             logger.warning("Failed to download album art")
             return
 
-        # Send to Pixoo64
-        await self.pixoo.send_image(image)
+        # Send to Pixoo64, optionally with the song title overlaid at the bottom
+        title = track_info.get("title", "") if self.config.show_title else ""
+        await self.pixoo.send_image(image, title=title)
 
     async def monitor_loop(self):
         """Main monitoring loop"""
@@ -467,6 +552,8 @@ class AlbumArtService:
         finally:
             self.running = False
             await self.lms.close()
+            # Restore the Pixoo64's default time/weather display
+            await self.pixoo.reset()
 
     def stop(self):
         """Stop the service"""
@@ -507,6 +594,12 @@ async def main():
         help="List available LMS players and exit"
     )
 
+    parser.add_argument(
+        "--show-title",
+        action="store_true",
+        help="Overlay the song title in a scrolling bar at the bottom"
+    )
+
     args = parser.parse_args()
 
     # Start with default config
@@ -521,6 +614,9 @@ async def main():
 
     if args.player_id:
         config.lms_player_id = args.player_id
+
+    if args.show_title:
+        config.show_title = True
 
     # Temporary LMS monitor for selection / listing
     temp_lms = LMSMonitor(config.lms_host, config.lms_port, "")

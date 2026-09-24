@@ -9,7 +9,7 @@ Single-service Python project: polls Lyrion Media Server (LMS) and pushes album 
 - `lms_pixoo_service.py` — the entire service (Config, PixooClient, LMSMonitor, AlbumArtService, CLI `main`). All real code lives here; other scripts import from it.
 - `test_*.py` — **manual hardware-integration scripts, not a test suite** (no pytest/unittest). They require a live LMS server and/or Pixoo64 on the network and will fail/hang without them. Don't run them to "verify" code changes.
 - `find_pixoo.py` — network scanner that probes the local /24 for Pixoo devices via `GET http://<ip>:80/get`. Safe to run (read-only probe).
-- `reset_pixoo.py` — restores the Pixoo64 to its default time/weather face (`Draw/ResetHttpGifId` + `Channel/SetIndex` 0). Uses `Config().pixoo_host` by default, `--ip` to override.
+- `reset_pixoo.py` — restores the Pixoo64 to its default time/weather face (`Draw/ResetHttpGifId` + `Channel/SetIndex` 0). Uses `Config().pixoo_host` by default, `--ip` to override. The service also does this automatically on exit (`AlbumArtService.start` finally-block calls `PixooClient.reset()`).
 - `setup.sh` / `run.sh` — create venv + install deps / activate venv + run service (Linux/Mac only).
 - `lms.diff` — leftover patch file, not source. Ignore unless asked.
 - Deps: `aiohttp`, `Pillow` (`requirements.txt`), Python 3.8+.
@@ -28,6 +28,8 @@ python lms_pixoo_service.py --host X --pixoo-ip Y --player-id Z   # or -s for in
 - **Pixoo64 protocol quirks:**
   - Sending an image is a 4-step POST sequence to `http://<ip>:80/post` (`Channel/SetIndex` → `Draw/ResetHttpGifId` → `Draw/SendHttpGif` → `Draw/SendHttpItemList`). Despite the name `SendHttpGif`, the payload is raw 64x64 RGB bytes (base64), not a GIF. Image must be exactly 64x64 RGB; alpha is composited onto black.
   - During an upload the device briefly flashes its built-in color-chart test pattern. `PixooClient.send_image` skips the push entirely if the pixel data is identical to what it last sent.
+  - Multi-frame animation: POST one `Draw/SendHttpGif` per frame, all sharing the same `PicID`, with `PicNum` = total frames, `PicOffset` = frame index, `PicSpeed` = ms per frame. The device loops the frames. `PixooClient.send_image(title=...)` uses this to scroll long song titles in a bottom bar (`make_title_frames`). Uploading many frames (~140+) takes ~20s and the device can occasionally reset the connection mid-upload — retrying works.
+  - Title overlay is opt-in: `--show-title` CLI flag / `Config.show_title` (default off = plain full-screen album art).
 - **LMS protocol:** JSON-RPC at `http://<host>:9000/jsonrpc.js`, method `slim.request`, params `[player_id, [command, ...]]` (empty player_id for server-level commands). Track changes detected by polling `status - 1 tags:alcu` and comparing track `id`. Cover art URL: `artwork_url` field, else `/music/{coverid}/cover.jpg`.
 - `LMSMonitor` reuses one `aiohttp.ClientSession`; `PixooClient` creates a new session per call. Follow the existing per-class pattern if touching networking code.
 - **The Pixoo64 replies to POSTs with JSON but a `text/html` content-type.** If you parse the response body (e.g. to check `error_code`), use `await response.json(content_type=None)` — see `reset_pixoo.py`. The service doesn't parse responses, which is why it never hits this.
