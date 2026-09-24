@@ -19,15 +19,19 @@
  
  ## Installation
  
- 1. Install Python dependencies:
- ```bash
- pip install -r requirements.txt
- ```
+1. Create a virtual environment and install Python dependencies using [uv](https://docs.astral.sh/uv/):
+```bash
+uv venv venv
+source venv/bin/activate
+uv pip install -r requirements.txt
+```
  
- 2. Find your Pixoo64's IP address:
-    - Open the Divoom app on your phone
-    - Go to Settings → Device Info
-    - Note the IP address
+2. Find your Pixoo64's IP address:
+   ```bash
+   python find_pixoo.py
+   ```
+   This scans your local network for Pixoo64 devices. Alternatively, open the
+   Divoom app on your phone → Settings → Device Info and note the IP address.
  
  3. Update configuration in `lms_pixoo_service.py`:
     - Set `pixoo_host` to your Pixoo64's IP address

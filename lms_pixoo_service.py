@@ -42,90 +42,110 @@ class PixooClient:
         self.host = host
         self.port = port
         self.base_url = f"http://{host}:{port}"
+        self._last_pixel_data: Optional[bytes] = None
+
+    @staticmethod
+    def _to_pixel_data(image: Image.Image) -> bytes:
+        """Convert image to raw 64x64 RGB bytes (row-major order)."""
+        # Ensure image is 64x64 RGB
+        if image.size != (64, 64):
+            image = image.resize((64, 64), Image.Resampling.LANCZOS)
+
+        # Convert to RGB
+        image = image.convert('RGB')
+
+        # Create raw RGB byte array (row-major order)
+        rgb_bytes = bytearray()
+        for y in range(64):
+            for x in range(64):
+                r, g, b = image.getpixel((x, y))
+                rgb_bytes.extend([r, g, b])
+
+        return bytes(rgb_bytes)
+
+    async def _push_pixel_data(self, pixel_data: bytes, session: aiohttp.ClientSession) -> bool:
+        """Push raw 64x64 RGB bytes to the display using the 4-step sequence."""
+        # Step 1: Switch to custom channel (channel 3)
+        channel_payload = {
+            "Command": "Channel/SetIndex",
+            "SelectIndex": 3
+        }
+        await session.post(
+            f"{self.base_url}/post",
+            json=channel_payload,
+            timeout=aiohttp.ClientTimeout(total=5)
+        )
+
+        # Step 2: Reset animation
+        reset_payload = {
+            "Command": "Draw/ResetHttpGifId"
+        }
+        await session.post(
+            f"{self.base_url}/post",
+            json=reset_payload,
+            timeout=aiohttp.ClientTimeout(total=5)
+        )
+
+        # Step 3: Send raw RGB pixel data
+        # (Note: Despite command name "SendHttpGif", we send raw RGB bytes)
+        pixel_payload = {
+            "Command": "Draw/SendHttpGif",
+            "PicNum": 1,
+            "PicWidth": 64,
+            "PicOffset": 0,
+            "PicID": 0,
+            "PicSpeed": 1000,
+            "PicData": base64.b64encode(pixel_data).decode('utf-8')
+        }
+
+        async with session.post(
+            f"{self.base_url}/post",
+            json=pixel_payload,
+            timeout=aiohttp.ClientTimeout(total=5)
+        ) as response:
+            # Check if pixel data was sent successfully
+            if response.status != 200:
+                logger.error(f"Pixoo64 returned status {response.status}")
+                return False
+
+        # Step 4: Play/display the image
+        play_payload = {
+            "Command": "Draw/SendHttpItemList",
+            "ItemList": []
+        }
+        async with session.post(
+            f"{self.base_url}/post",
+            json=play_payload,
+            timeout=aiohttp.ClientTimeout(total=5)
+        ) as response:
+            if response.status != 200:
+                logger.error(f"Failed to display image: status {response.status}")
+                return False
+
+        return True
 
     async def send_image(self, image: Image.Image) -> bool:
         """
         Send image to Pixoo64 display
         Image should already be 64x64 pixels
+
+        Skips the update if the image is identical to the one currently shown.
         """
         try:
-            # Ensure image is 64x64 RGB
-            if image.size != (64, 64):
-                image = image.resize((64, 64), Image.Resampling.LANCZOS)
+            pixel_data = self._to_pixel_data(image)
 
-            # Convert to RGB
-            image = image.convert('RGB')
-
-            # Create raw RGB byte array (row-major order)
-            rgb_bytes = bytearray()
-            for y in range(64):
-                for x in range(64):
-                    r, g, b = image.getpixel((x, y))
-                    rgb_bytes.extend([r, g, b])
-
-            # Convert to bytes for base64 encoding
-            pixel_data = bytes(rgb_bytes)
+            # Nothing to do if the display already shows this exact image
+            if pixel_data == self._last_pixel_data:
+                logger.info("Image unchanged; skipping update")
+                return True
 
             async with aiohttp.ClientSession() as session:
-                # Step 1: Switch to custom channel (channel 3)
-                channel_payload = {
-                    "Command": "Channel/SetIndex",
-                    "SelectIndex": 3
-                }
-                await session.post(
-                    f"{self.base_url}/post",
-                    json=channel_payload,
-                    timeout=aiohttp.ClientTimeout(total=5)
-                )
+                if not await self._push_pixel_data(pixel_data, session):
+                    return False
 
-                # Step 2: Reset animation
-                reset_payload = {
-                    "Command": "Draw/ResetHttpGifId"
-                }
-                await session.post(
-                    f"{self.base_url}/post",
-                    json=reset_payload,
-                    timeout=aiohttp.ClientTimeout(total=5)
-                )
-
-                # Step 3: Send raw RGB pixel data
-                # (Note: Despite command name "SendHttpGif", we send raw RGB bytes)
-                pixel_payload = {
-                    "Command": "Draw/SendHttpGif",
-                    "PicNum": 1,
-                    "PicWidth": 64,
-                    "PicOffset": 0,
-                    "PicID": 0,
-                    "PicSpeed": 1000,
-                    "PicData": base64.b64encode(pixel_data).decode('utf-8')
-                }
-
-                async with session.post(
-                    f"{self.base_url}/post",
-                    json=pixel_payload,
-                    timeout=aiohttp.ClientTimeout(total=5)
-                ) as response:
-                    # Check if pixel data was sent successfully
-                    if response.status != 200:
-                        logger.error(f"Pixoo64 returned status {response.status}")
-                        return False
-
-                # Step 4: Play/display the image
-                play_payload = {
-                    "Command": "Draw/SendHttpItemList",
-                    "ItemList": []
-                }
-                async with session.post(
-                    f"{self.base_url}/post",
-                    json=play_payload,
-                    timeout=aiohttp.ClientTimeout(total=5)
-                ) as response:
-                    if response.status == 200:
-                        logger.info("Successfully sent image to Pixoo64")
-                        return True
-                    else:
-                        logger.error(f"Failed to display image: status {response.status}")
-                        return False
+            self._last_pixel_data = pixel_data
+            logger.info("Successfully sent image to Pixoo64")
+            return True
 
         except Exception as e:
             logger.error(f"Error sending image to Pixoo64: {e}")
