@@ -3,98 +3,20 @@
 Test script to verify LMS connectivity and monitor track changes
 """
 
+import argparse
 import asyncio
-import aiohttp
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional
 from datetime import datetime
+
+from lms import LMSMonitor
+from lms_pixoo_service import Config
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-class LMSTestClient:
-    """Simple LMS test client"""
-
-    def __init__(self, host: str, port: int):
-        self.host = host
-        self.port = port
-        self.base_url = f"http://{host}:{port}"
-        self.session: Optional[aiohttp.ClientSession] = None
-
-    async def _send_command(self, player_id: str, command: str, params: list = None) -> Optional[Dict[str, Any]]:
-        """Send JSON-RPC command to LMS"""
-        if params is None:
-            params = []
-
-        payload = {
-            "id": 1,
-            "method": "slim.request",
-            "params": [player_id, [command] + params]
-        }
-
-        try:
-            if not self.session:
-                self.session = aiohttp.ClientSession()
-
-            async with self.session.post(
-                f"{self.base_url}/jsonrpc.js",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data.get('result', {})
-                else:
-                    logger.error(f"LMS returned status {response.status}")
-                    return None
-        except aiohttp.ClientConnectorError:
-            logger.error(f"Cannot connect to LMS at {self.base_url}")
-            logger.error("Please check that LMS is running and the host/port are correct")
-            return None
-        except Exception as e:
-            logger.error(f"Error communicating with LMS: {e}")
-            return None
-
-    async def test_connection(self) -> bool:
-        """Test basic connection to LMS"""
-        result = await self._send_command("", "serverstatus", ["0", "0"])
-        return result is not None
-
-    async def get_server_info(self) -> Optional[Dict[str, Any]]:
-        """Get LMS server information"""
-        return await self._send_command("", "serverstatus", ["0", "0"])
-
-    async def get_players(self) -> List[Dict[str, Any]]:
-        """Get list of all connected players"""
-        result = await self._send_command("", "players", ["0", "999"])
-        if result and "players_loop" in result:
-            return result["players_loop"]
-        return []
-
-    async def get_player_status(self, player_id: str) -> Optional[Dict[str, Any]]:
-        """Get detailed status for a specific player"""
-        return await self._send_command(player_id, "status", ["-", "1", "tags:aAlbumArtistcdDgiIjJKlLmMnNoOpPqrRsStTuUvwxXyY"])
-
-    async def get_current_track(self, player_id: str) -> Optional[Dict[str, Any]]:
-        """Get current track information"""
-        status = await self.get_player_status(player_id)
-        if status and "playlist_loop" in status and len(status["playlist_loop"]) > 0:
-            track = status["playlist_loop"][0]
-            # Add playback state info
-            track["mode"] = status.get("mode", "stop")
-            track["time"] = status.get("time", 0)
-            track["duration"] = status.get("duration", 0)
-            return track
-        return None
-
-    async def close(self):
-        """Close the session"""
-        if self.session:
-            await self.session.close()
 
 
 def format_time(seconds: float) -> str:
@@ -188,7 +110,21 @@ def display_track_info(track: Dict[str, Any], is_update: bool = False):
     print("=" * 70)
 
 
-async def monitor_playback(client: LMSTestClient, player_id: str, interval: float = 1.0):
+async def get_current_track(client: LMSMonitor, player_id: str) -> Optional[Dict[str, Any]]:
+    """Get current track info plus playback state."""
+    status = await client.send_command(
+        "status", ["-", "1", "tags:aAlbumArtistcdDgiIjJKlLmMnNoOpPqrRsStTuUvwxXyY"],
+        player_id=player_id)
+    if status and "playlist_loop" in status and len(status["playlist_loop"]) > 0:
+        track = status["playlist_loop"][0]
+        track["mode"] = status.get("mode", "stop")
+        track["time"] = status.get("time", 0)
+        track["duration"] = status.get("duration", 0)
+        return track
+    return None
+
+
+async def monitor_playback(client: LMSMonitor, player_id: str, interval: float = 1.0):
     """Monitor playback and display track changes"""
     print("\n" + "=" * 70)
     print("MONITORING PLAYBACK")
@@ -202,7 +138,7 @@ async def monitor_playback(client: LMSTestClient, player_id: str, interval: floa
 
     while True:
         try:
-            track = await client.get_current_track(player_id)
+            track = await get_current_track(client, player_id)
 
             if track:
                 track_id = track.get('id')
@@ -232,7 +168,7 @@ async def monitor_playback(client: LMSTestClient, player_id: str, interval: floa
             print("\n\nMonitoring stopped by user")
             return
         except Exception as e:
-            logger.error(f"Error during monitoring: {e}")
+            logger.error("Error during monitoring: %s", e)
             await asyncio.sleep(interval)
 
 
@@ -266,43 +202,43 @@ async def interactive_player_selection(players: List[Dict[str, Any]]) -> Optiona
 
 async def main():
     """Main test routine"""
-    # Configuration - UPDATE THESE
-    LMS_HOST = "192.168.2.78"
-    LMS_PORT = 9000
+    parser = argparse.ArgumentParser(description="LMS connectivity test")
+    parser.add_argument("--host", default=Config().lms_host,
+                        help="LMS hostname or IP (default: from Config)")
+    parser.add_argument("--port", type=int, default=Config().lms_port,
+                        help="LMS port (default: from Config)")
+    args = parser.parse_args()
 
     print("=" * 70)
     print("LMS CONNECTIVITY TEST")
     print("=" * 70)
-    print(f"\nLMS Host: {LMS_HOST}")
-    print(f"LMS Port: {LMS_PORT}")
+    print(f"\nLMS Host: {args.host}")
+    print(f"LMS Port: {args.port}")
 
-    client = LMSTestClient(LMS_HOST, LMS_PORT)
+    client = LMSMonitor(args.host, args.port)
 
     try:
         # Test 1: Basic connectivity
         print("\n[1/4] Testing LMS connection...")
-        if not await client.test_connection():
+        server_info = await client.send_command("serverstatus", ["0", "0"], player_id="")
+        if server_info is None:
             print("\n✗ FAILED: Cannot connect to LMS")
             print("\nTroubleshooting:")
             print("  1. Is LMS running?")
             print("  2. Is the host/port correct?")
-            print(f"  3. Can you access http://{LMS_HOST}:{LMS_PORT} in a browser?")
+            print(f"  3. Can you access http://{args.host}:{args.port} in a browser?")
             return
 
         print("✓ Connection successful!")
 
         # Test 2: Get server info
         print("\n[2/4] Retrieving server information...")
-        server_info = await client.get_server_info()
-        if server_info:
-            display_server_info(server_info)
-            print("✓ Server info retrieved!")
-        else:
-            print("✗ Could not retrieve server info")
+        display_server_info(server_info)
+        print("✓ Server info retrieved!")
 
         # Test 3: Get players
         print("\n[3/4] Discovering players...")
-        players = await client.get_players()
+        players = await client.get_players(count=999)
         display_players(players)
 
         if not players:
@@ -329,7 +265,7 @@ async def main():
     except KeyboardInterrupt:
         print("\n\nMonitoring stopped by user")
     except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
+        logger.error("Unexpected error: %s", e, exc_info=True)
     finally:
         await client.close()
         print("\n✓ Test completed")
@@ -339,8 +275,9 @@ def test_monitor_playback_returns_when_cancelled():
     """The monitor loop should exit cleanly when the task is cancelled."""
 
     class DummyClient:
-        async def get_current_track(self, player_id: str):
-            return {"id": "track-1", "mode": "play"}
+        async def send_command(self, command, params=None, player_id=None):
+            return {"playlist_loop": [{"id": "track-1"}], "mode": "play",
+                    "time": 0, "duration": 0}
 
     async def run_monitor():
         task = asyncio.create_task(monitor_playback(DummyClient(), "player-1", interval=0.01))

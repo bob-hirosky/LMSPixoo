@@ -14,42 +14,12 @@ Usage:
 
 import argparse
 import asyncio
-
-import aiohttp
+import logging
 
 from lms_pixoo_service import Config
+from pixoo import reset_pixoo
 
-
-async def reset_pixoo(host: str, port: int = 80) -> bool:
-    """Restore the default clock channel and clear the HTTP gif stream."""
-    base_url = f"http://{host}:{port}"
-    steps = [
-        # Stop any HTTP gif stream the service may have started
-        {"Command": "Draw/ResetHttpGifId"},
-        # Switch back to the clock channel (0 = time/weather faces)
-        {"Command": "Channel/SetIndex", "SelectIndex": 0},
-    ]
-    try:
-        async with aiohttp.ClientSession() as session:
-            for payload in steps:
-                async with session.post(
-                    f"{base_url}/post",
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as response:
-                    if response.status != 200:
-                        print(f"Pixoo64 returned status {response.status} for {payload['Command']}")
-                        return False
-                    # Device responds with JSON but a text/html content-type
-                    data = await response.json(content_type=None)
-                    if data.get("error_code") != 0:
-                        print(f"Pixoo64 rejected {payload['Command']}: {data}")
-                        return False
-        print(f"Pixoo64 at {host} reset to time/weather display.")
-        return True
-    except Exception as e:
-        print(f"Cannot reach Pixoo64 at {base_url}: {e}")
-        return False
+logging.basicConfig(level=logging.INFO)
 
 
 async def main():
@@ -64,6 +34,10 @@ async def main():
     args = parser.parse_args()
 
     ok = await reset_pixoo(args.ip)
+    if ok:
+        print(f"Pixoo64 at {args.ip} reset to time/weather display.")
+    else:
+        print(f"Failed to reset Pixoo64 at {args.ip} (see log above).")
     raise SystemExit(0 if ok else 1)
 
 
